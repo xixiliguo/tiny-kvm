@@ -3,13 +3,9 @@ package vmm
 import (
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
 	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
-	"syscall"
 
 	"github.com/xixiliguo/tiny-kvm/arch"
 	"github.com/xixiliguo/tiny-kvm/hyper"
@@ -19,7 +15,6 @@ import (
 type VCPU struct {
 	ID   uint32
 	Vcpu hyper.Vcpu
-	tid  atomic.Int32
 }
 
 // CpuManager owns all boot vCPUs and the common CPUID table.
@@ -30,18 +25,13 @@ type CpuManager struct {
 	config      CpusConfig
 	commonCPUID []hyper.CpuIdEntry
 	vcpus       []*VCPU
-	mu          sync.Mutex
 	wg          sync.WaitGroup
+	runOnce     sync.Once
+	stopOnce    sync.Once
 	done        chan struct{}
-	running     bool
 	errMu       sync.Mutex
 	err         error
 }
-
-var (
-	stopSignalOnce    sync.Once
-	stopSignalChannel = make(chan os.Signal, 1)
-)
 
 // NewCpuManager creates boot vCPUs and prepares the guest CPUID table.
 func NewCpuManager(hv hyper.Hypervisor, vm hyper.Vm, ops hyper.VmOps, config CpusConfig) (*CpuManager, error) {
@@ -53,10 +43,7 @@ func NewCpuManager(hv hyper.Hypervisor, vm hyper.Vm, ops hyper.VmOps, config Cpu
 		return nil, fmt.Errorf("cpu: requested %d vCPUs, host supports %d", config.BootVcpus, maxVCpus)
 	}
 	physBits := min(GetHostCpuPhysBits(), config.MaxPhysBits)
-	cpuid, err := hyper.GenerateCommonCpuid(hv, physBits, &hyper.CpuidConfig{
-		PhysBits:  physBits,
-		KvmHyperv: config.KvmHyperv,
-	})
+	cpuid, err := generateGuestCPUID(hv, physBits, config.KvmHyperv)
 	if err != nil {
 		return nil, fmt.Errorf("cpu: generate CPUID: %w", err)
 	}
@@ -67,6 +54,7 @@ func NewCpuManager(hv hyper.Hypervisor, vm hyper.Vm, ops hyper.VmOps, config Cpu
 		ops:         ops,
 		config:      config,
 		commonCPUID: cpuid,
+		done:        make(chan struct{}),
 	}
 	for i := uint32(0); i < config.BootVcpus; i++ {
 		vcpu, err := vm.CreateVcpu(i, ops)
@@ -81,17 +69,56 @@ func NewCpuManager(hv hyper.Hypervisor, vm hyper.Vm, ops hyper.VmOps, config Cpu
 // Configure prepares every vCPU for the selected kernel entry point.
 func (c *CpuManager) Configure(boot *arch.BootSetup) error {
 	for _, vcpu := range c.vcpus {
-		cpuid := slices.Clone(c.commonCPUID)
-		if err := arch.ConfigureVcpu(
+		if err := configureVCPU(
 			vcpu.Vcpu,
 			vcpu.ID,
 			boot,
-			cpuid,
-			c.config.KvmHyperv,
+			slices.Clone(c.commonCPUID),
 			c.hyper.GetCPUVendor(),
 		); err != nil {
 			return fmt.Errorf("cpu: configure vCPU %d: %w", vcpu.ID, err)
 		}
+	}
+	return nil
+}
+
+func configureVCPU(
+	vcpu hyper.Vcpu,
+	id uint32,
+	boot *arch.BootSetup,
+	cpuid []hyper.CpuIdEntry,
+	vendor hyper.CPUVendor,
+) error {
+	cpuid, err := patchVCPUID(cpuid, id, vendor)
+	if err != nil {
+		return err
+	}
+	if err := vcpu.SetCpuid2(cpuid); err != nil {
+		return fmt.Errorf("set CPUID: %w", err)
+	}
+	if err := vcpu.SetMsrs(vcpu.BootMsrEntries()); err != nil {
+		return fmt.Errorf("set boot MSRs: %w", err)
+	}
+	if boot != nil {
+		if err := arch.SetupRegs(vcpu, boot.KernelEntryPoint); err != nil {
+			return fmt.Errorf("set boot registers: %w", err)
+		}
+		if err := vcpu.SetFpu(&hyper.FpuState{Fcw: 0x37f, Mxcsr: 0x1f80}); err != nil {
+			return fmt.Errorf("set FPU state: %w", err)
+		}
+		sregs, err := vcpu.GetSregs()
+		if err != nil {
+			return fmt.Errorf("get special registers: %w", err)
+		}
+		if err := arch.ConfigureSegmentsAndSregs(boot.GuestMemory, &sregs, true); err != nil {
+			return fmt.Errorf("configure segments: %w", err)
+		}
+		if err := vcpu.SetSregs(&sregs); err != nil {
+			return fmt.Errorf("set special registers: %w", err)
+		}
+	}
+	if err := hyper.SetLint(vcpu); err != nil {
+		return fmt.Errorf("configure LAPIC: %w", err)
 	}
 	return nil
 }
@@ -103,32 +130,21 @@ func (c *CpuManager) VCPUs() []*VCPU {
 
 // Start launches all boot vCPUs.
 func (c *CpuManager) Start() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.running {
-		return errors.New("cpu: vCPUs have already been started")
-	}
-	stopSignalOnce.Do(func() {
-		signal.Notify(stopSignalChannel, syscall.SIGUSR1)
+	started := false
+	c.runOnce.Do(func() {
+		started = true
+		for _, vcpu := range c.vcpus {
+			c.wg.Add(1)
+			go c.run(vcpu)
+		}
 		go func() {
-			for range stopSignalChannel {
-			}
+			c.wg.Wait()
+			close(c.done)
 		}()
 	})
-	c.running = true
-	c.done = make(chan struct{})
-	done := c.done
-	for _, vcpu := range c.vcpus {
-		c.wg.Add(1)
-		go c.run(vcpu)
+	if !started {
+		return errors.New("cpu: vCPUs have already been started")
 	}
-	go func() {
-		c.wg.Wait()
-		c.mu.Lock()
-		c.running = false
-		c.mu.Unlock()
-		close(done)
-	}()
 	return nil
 }
 
@@ -136,24 +152,19 @@ func (c *CpuManager) run(vcpu *VCPU) {
 	defer c.wg.Done()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	vcpu.tid.Store(int32(syscall.Gettid()))
-	defer vcpu.tid.Store(0)
 	for {
 		exit, err := vcpu.Vcpu.Run()
 		if err != nil {
 			c.recordError(fmt.Errorf("cpu: vCPU %d run: %w", vcpu.ID, err))
-			c.Stop()
 			return
 		}
 		switch exit {
 		case hyper.VmExitIgnore, hyper.VmExitIoapicEoi:
 			continue
 		case hyper.VmExitReset, hyper.VmExitShutdown:
-			c.Stop()
 			return
 		default:
 			c.recordError(fmt.Errorf("cpu: vCPU %d stopped with unexpected exit %s", vcpu.ID, exit))
-			c.Stop()
 			return
 		}
 	}
@@ -169,13 +180,7 @@ func (c *CpuManager) recordError(err error) {
 
 // Wait blocks until every vCPU exits.
 func (c *CpuManager) Wait() error {
-	c.mu.Lock()
-	done := c.done
-	c.mu.Unlock()
-	if done == nil {
-		return errors.New("cpu: vCPUs have not been started")
-	}
-	<-done
+	<-c.done
 	c.errMu.Lock()
 	defer c.errMu.Unlock()
 	return c.err
@@ -183,17 +188,9 @@ func (c *CpuManager) Wait() error {
 
 // Stop requests all vCPUs to leave guest execution.
 func (c *CpuManager) Stop() {
-	for _, vcpu := range c.vcpus {
-		vcpu.Vcpu.SetImmediateExit(true)
-		if tid := vcpu.tid.Load(); tid > 0 {
-			_ = syscall.Tgkill(os.Getpid(), int(tid), syscall.SIGUSR1)
+	c.stopOnce.Do(func() {
+		for _, vcpu := range c.vcpus {
+			vcpu.Vcpu.SetImmediateExit(true)
 		}
-	}
-}
-
-// ResetStop clears the immediate-exit state before the vCPUs are run again.
-func (c *CpuManager) ResetStop() {
-	for _, vcpu := range c.vcpus {
-		vcpu.Vcpu.SetImmediateExit(false)
-	}
+	})
 }

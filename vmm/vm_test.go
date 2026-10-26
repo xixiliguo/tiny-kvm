@@ -155,7 +155,7 @@ func TestNewVMConfiguresCompleteBootPath(t *testing.T) {
 		}
 		apicID, ok := hyper.GetCpuidReg(vcpu.cpuid, 0xb, 0, hyper.CpuidRegEDX)
 		if !ok || apicID != uint32(i) {
-			t.Fatalf("vCPU %d x2APIC id = %d, present=%v", i, apicID, ok)
+			t.Fatalf("vCPU %d x2APIC id = %d, present=%v, leaves=%+v", i, apicID, ok, vcpu.cpuid)
 		}
 	}
 	if err := vm.Boot(); err != nil {

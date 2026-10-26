@@ -51,7 +51,6 @@ func NewDeviceManager(
 	}
 	serial, err := NewSerialManager(NewLegacyInterruptController(interrupts), serialConfig)
 	if err != nil {
-		_ = resetEvent.Close()
 		return nil, err
 	}
 
@@ -129,11 +128,6 @@ func (d *DeviceManager) Close() error {
 	var first error
 	if d.serial != nil {
 		if err := d.serial.Close(); err != nil {
-			first = err
-		}
-	}
-	if d.resetEvent != nil {
-		if err := d.resetEvent.Close(); err != nil && first == nil {
 			first = err
 		}
 	}

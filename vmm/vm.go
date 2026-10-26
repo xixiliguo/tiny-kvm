@@ -76,9 +76,10 @@ func NewVM(hv hyper.Hypervisor, config VmConfig) (*VM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vm: create KVM VM: %w", err)
 	}
-	if err := hyperVm.SetIdentityMapAddress(arch.KvmIdentityMapStart); err != nil {
-		return nil, fmt.Errorf("vm: set identity map: %w", err)
-	}
+	// KVM_SET_IDENTITY_MAP_ADDR is a legacy real-mode compatibility hint. The
+	// bzImage/PVH paths start in protected mode and do not require it, so keep
+	// this best-effort instead of rejecting an otherwise usable KVM VM.
+	_ = hyperVm.SetIdentityMapAddress(arch.KvmIdentityMapStart)
 	if err := hyperVm.SetTssAddress(arch.KvmTssStart); err != nil {
 		return nil, fmt.Errorf("vm: set TSS: %w", err)
 	}
@@ -127,17 +128,15 @@ func NewVM(hv hyper.Hypervisor, config VmConfig) (*VM, error) {
 		uuid = config.Platform.UUID
 		oemStrings = config.Platform.OEMStrings
 	}
-	if err := arch.ConfigureSystem(
+	if err := configureGuestSystem(
 		memory.GuestMemory(),
-		arch.CmdlineStart,
-		arch.CmdlineMaxSize,
-		payload.initramfs,
-		config.Cpus.BootVcpus,
-		payload.entry.SetupHeader,
+		payload,
 		rsdpAddr,
-		serialNumber,
-		uuid,
-		oemStrings,
+		bootPlatform{
+			serialNumber: serialNumber,
+			uuid:         uuid,
+			oemStrings:   oemStrings,
+		},
 	); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("vm: configure system: %w", err)

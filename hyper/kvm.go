@@ -639,8 +639,10 @@ func (v *KvmVcpu) Run() (VmExit, error) {
 		var err error
 		switch pio.Direction {
 		case KvmExitIoIn:
+			// fmt.Printf("pio read: %+v %+v\n", pio, data)
 			err = v.Ops.PioRead(port, data)
 		case KvmExitIoOut:
+			// fmt.Printf("pio write: %+v %+v %c\n", pio, data, data[0])
 			err = v.Ops.PioWrite(port, data)
 		}
 		if err != nil {
@@ -655,8 +657,10 @@ func (v *KvmVcpu) Run() (VmExit, error) {
 
 		var err error
 		if mmio.Is_write != 0 {
+			fmt.Printf("mmio read: 0x%x %+v\n", addr, data)
 			err = v.Ops.MmioWrite(addr, data)
 		} else {
+			fmt.Printf("mmio write: 0x%x %+v\n", addr, data)
 			err = v.Ops.MmioRead(addr, data)
 		}
 
@@ -665,10 +669,14 @@ func (v *KvmVcpu) Run() (VmExit, error) {
 		}
 		return VmExitIgnore, nil
 	case KvmExitIoapciEoi:
+		eoi := (*eoi)(unsafe.Pointer(&v.RunData.Data[0]))
+		fmt.Printf("eoi: %+v\n", eoi.Vector)
 		return VmExitIoapicEoi, nil
 	case KvmExitHlt:
+		fmt.Printf("receive hlt\n")
 		return VmExitReset, nil
 	case KvmExitShutDown:
+		fmt.Printf("receive shutdown\n")
 		return VmExitReset, nil
 
 	case KvmExitUnkonw:
@@ -682,16 +690,23 @@ func (v *KvmVcpu) Run() (VmExit, error) {
 	case KvmExitDebug:
 		return VmExitDebug, nil
 	case KvmExitX86Rdmsr:
+		msr := (*msr)(unsafe.Pointer(&v.RunData.Data[0]))
+		fmt.Printf("msr: %+v\n", msr)
 		return VmExitUnknown, nil
 	case KvmExitX86Wrmsr:
+		msr := (*msr)(unsafe.Pointer(&v.RunData.Data[0]))
+		fmt.Printf("msr: %+v\n", msr)
 		return VmExitUnknown, nil
 	case KvmExitIrqWinOpen:
 		return VmExitUnknown, nil
 	case KvmExitFailEntry:
+		failEntry := (*fail_entry)(unsafe.Pointer(&v.RunData.Data[0]))
+		fmt.Printf("fail entry: %+v\n", failEntry)
 		return VmExitUnknown, nil
 	case KvmExitNmi:
 		return VmExitUnknown, nil
 	default:
+		fmt.Printf("unknow reason: %d\n", v.RunData.Exit_reason)
 		return VmExitUnknown, nil
 	}
 

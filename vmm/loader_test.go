@@ -58,33 +58,26 @@ func TestLoadBundledPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := arch.ConfigureSystem(
+	if err := configureGuestSystem(
 		memory,
-		arch.CmdlineStart,
-		arch.CmdlineMaxSize,
-		payload.initramfs,
-		1,
-		payload.entry.SetupHeader,
+		payload,
 		rsdp,
-		"",
-		"",
-		nil,
+		bootPlatform{},
 	); err != nil {
 		t.Fatal(err)
 	}
-	var bootParams arch.BootParams
 	zeroPage := mustRead(t, memory, arch.ZeroPageStart, arch.ZeroPageSize)
-	if err := binary.Read(bytes.NewReader(zeroPage), binary.LittleEndian, &bootParams); err != nil {
-		t.Fatal(err)
+	cmdlinePtr := binary.LittleEndian.Uint32(zeroPage[setupHeaderOffset+55 : setupHeaderOffset+59])
+	if cmdlinePtr != uint32(arch.CmdlineStart) {
+		t.Fatalf("boot_params cmdline pointer = 0x%x", cmdlinePtr)
 	}
-	if bootParams.Hdr.CmdLinePtr != uint32(arch.CmdlineStart) {
-		t.Fatalf("boot_params cmdline pointer = 0x%x", bootParams.Hdr.CmdLinePtr)
+	ramdiskSize := binary.LittleEndian.Uint32(zeroPage[setupHeaderOffset+43 : setupHeaderOffset+47])
+	if ramdiskSize != uint32(payload.initramfs.Size) {
+		t.Fatalf("boot_params initramfs size = %d", ramdiskSize)
 	}
-	if bootParams.Hdr.RamdiskSize != uint32(payload.initramfs.Size) {
-		t.Fatalf("boot_params initramfs size = %d", bootParams.Hdr.RamdiskSize)
-	}
-	if bootParams.AcpiRsdpAddr != rsdp {
-		t.Fatalf("boot_params RSDP = 0x%x, want 0x%x", bootParams.AcpiRsdpAddr, rsdp)
+	rsdpPointer := binary.LittleEndian.Uint64(zeroPage[acpiRSDPOffset : acpiRSDPOffset+8])
+	if rsdpPointer != rsdp {
+		t.Fatalf("boot_params RSDP = 0x%x, want 0x%x", rsdpPointer, rsdp)
 	}
 }
 
